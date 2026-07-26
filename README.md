@@ -145,7 +145,7 @@ general traffic isn't tunnelled at all.
 
 Ingress is `UDP 51820` from **your current public IP only**. `up.sh` detects your
 IP each run and updates the SG rule directly via the AWS CLI (revoke the old, add
-the current) — so if your Swiss residential IP changed since last time, just running
+the current) — so if your residential IP changed since last time, just running
 `up.sh` fixes it.
 
 If your IP changes *mid-session* the tunnel drops and won't reconnect until you
