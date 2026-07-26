@@ -1,0 +1,24 @@
+# Terraform state (may contain resource metadata) and working dirs
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Local per-user var file written by setup.sh
+terraform.tfvars
+
+# Generated PAC (served over localhost http; contains no secrets)
+pac/
+
+# Local client material — private key + rendered configs are secret.
+# Ignore the dir contents, but DO track the (non-secret) domain list.
+# Note: `client/*` (not `client/`) so git still descends and honours the negation.
+client/*
+!client/domains.txt
+
+# Legacy imperative scripts kept for reference only
+legacy/
+
+# macOS + IDE cruft (also leaks local paths / username)
+.DS_Store
+.idea/

@@ -1,0 +1,51 @@
+# ===========================================================================
+# Domains routed through the Frankfurt proxy (split tunnel).
+#
+#   - One domain per line. Subdomains are matched automatically
+#     (e.g. "discovery.com" also matches "api.discovery.com").
+#   - Lines starting with # are ignored.
+#   - After editing, re-run ./up.sh to regenerate client/discovery.pac.
+#
+# HOW TO CHASE DOWN THE REAL LIST WHILE STREAMING:
+#   Safari ▸ Develop ▸ Show Web Inspector ▸ Network tab. Start playback and watch
+#   which hostnames appear. The geo/entitlement API and the video segments usually
+#   live on DIFFERENT hosts than the homepage — if those aren't listed here, the
+#   unblock can fail even though the site loads fine. Add what you see, re-run up.sh.
+# ===========================================================================
+
+# --- Discovery+ / Eurosport / WBD core (brand-owned; safe to route) ---
+discoveryplus.com
+discovery.com
+disco-api.com          # backend API: auth, config, geo/entitlement, playback manifests
+eurosport.com
+eurosport.de           # German Eurosport front-end (you want the DE catalogue)
+dplay.com              # legacy Dplay backend, still referenced in places
+globalcyclingnetwork.com
+
+# --- Plausible extras (uncomment if you spot them in the Network tab) ---
+# gcn.tv
+# dsc.tv
+# discoveryplus.in
+# discoveryplus.co.uk
+# players.brightcove.net    # shared player host — only if the player embeds it
+# imgix.net                 # shared image CDN — only add the exact subdomain you see
+
+# --- Shared CDNs — BROAD. A wildcard here routes traffic for THOUSANDS of unrelated
+#     sites through Frankfurt and will slow normal browsing. Strongly prefer copying
+#     the SPECIFIC hostname from the Network tab (e.g. d2abc...cloudfront.net) and
+#     adding just that line. Uncomment a whole wildcard only as a last resort. ---
+# akamaized.net
+# akamaihd.net
+# cloudfront.net
+# fastly.net
+# llnwd.net
+# edgekey.net
+# edgesuite.net
+
+# --- Analytics / telemetry — usually NOT needed for unblocking. Listed so you can
+#     rule them out; leave commented unless the player genuinely gates on them. ---
+# conviva.com
+# mux.com
+# google-analytics.com
+# googletagmanager.com
+# segment.io

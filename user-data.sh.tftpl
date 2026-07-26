@@ -1,0 +1,85 @@
+#!/bin/bash
+# No `set -x` — the fetched private key must never land in the boot log.
+set -euo pipefail
+
+dnf install -y wireguard-tools iptables-nft squid
+
+# We manage this box via SSM, so SSH is unnecessary attack surface.
+systemctl disable --now sshd 2>/dev/null || true
+
+# Automatic security updates.
+dnf install -y dnf-automatic || true
+sed -i 's/^apply_updates = no/apply_updates = yes/'      /etc/dnf/automatic.conf 2>/dev/null || true
+sed -i 's/^upgrade_type = default/upgrade_type = security/' /etc/dnf/automatic.conf 2>/dev/null || true
+systemctl enable --now dnf-automatic.timer 2>/dev/null || true
+
+# IP forwarding.
+echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-wireguard.conf
+sysctl -p /etc/sysctl.d/99-wireguard.conf
+
+# Primary interface, for NAT masquerade.
+IFACE=$(ip route show default | awk '{print $5; exit}')
+
+# Fetch a Secrets Manager secret's value, or generate + store it if empty. Retries
+# while the instance role finishes propagating on first boot. Get-or-create keeps
+# the values stable across rebuilds, so the client config never needs re-importing.
+get_or_create() {
+  local arn="$1" gen="$2" val new i
+  for i in $(seq 1 30); do
+    val=$(aws secretsmanager get-secret-value --region ${region} --secret-id "$arn" --query SecretString --output text 2>/dev/null || true)
+    if [ -n "$val" ] && [ "$val" != "None" ]; then printf '%s' "$val"; return 0; fi
+    new=$($gen)
+    ( umask 077; printf '%s' "$new" > /root/.wgtmp )
+    if aws secretsmanager put-secret-value --region ${region} --secret-id "$arn" --secret-string "file:///root/.wgtmp" >/dev/null 2>&1; then
+      rm -f /root/.wgtmp; printf '%s' "$new"; return 0
+    fi
+    rm -f /root/.wgtmp; sleep 5
+  done
+  return 1
+}
+
+SRV_PRIV=$(get_or_create "${priv_secret_id}" "wg genkey")  || { echo "FATAL: could not obtain server key" >&2; exit 1; }
+PSK=$(get_or_create "${psk_secret_id}" "wg genpsk")        || { echo "FATAL: could not obtain preshared key" >&2; exit 1; }
+
+umask 077
+cat > /etc/wireguard/wg0.conf <<WG
+[Interface]
+Address = ${wg_net}.1/24
+ListenPort = ${wg_port}
+PrivateKey = $SRV_PRIV
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $IFACE -j MASQUERADE
+
+[Peer]
+PublicKey = ${client_public_key}
+PresharedKey = $PSK
+AllowedIPs = ${wg_net}.2/32
+WG
+
+systemctl enable --now wg-quick@wg0
+
+# Forward proxy for domain-based split tunneling. Reachable ONLY from the tunnel
+# subnet (the security group never exposes 3128), so browser traffic for the
+# selected domains is proxied out of the VPN region with server-side DNS resolution.
+cat > /etc/squid/squid.conf <<'SQUID'
+acl SSL_ports port 443
+acl Safe_ports port 80 443
+acl CONNECT method CONNECT
+acl wgclients src ${wg_net}.0/24
+
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+http_access allow wgclients
+http_access deny all
+
+http_port 3128
+cache deny all
+access_log none
+SQUID
+systemctl enable --now squid
+
+# Publish the public key LAST, as a readiness beacon: once this parameter is set,
+# WireGuard is up and listening.
+SRV_PUB=$(printf '%s' "$SRV_PRIV" | wg pubkey)
+unset SRV_PRIV PSK
+aws ssm put-parameter --region ${region} --name "${param_name}" --type String --overwrite --value "$SRV_PUB" >/dev/null 2>&1 || true
