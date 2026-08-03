@@ -114,22 +114,31 @@ WireGuard routes by IP, not by domain, so the split is done at the browser layer
 - `up.sh` writes a **PAC file** (`pac/discovery.pac`) that sends the domains in
   `client/domains.txt` to the proxy and everything else DIRECT. DNS for those
   domains is resolved server-side in the VPN region, which is what makes the unblock work.
-- The PAC is served over **`http://127.0.0.1:8899`** by a launchd agent
-  (`~/Library/LaunchAgents/local.vpn-pac.plist`), because **macOS silently
-  ignores `file://` PAC URLs** — CFNetwork evaluates PACs system-side and only
-  reliably fetches them over http(s); a failed load falls back to DIRECT with no
-  error. Serving the same file over localhost http is what makes Safari apply it.
+- The PAC is served over **`http://127.0.0.1:8899`** by a launchd agent, because
+  **macOS silently ignores `file://` PAC URLs** — CFNetwork evaluates PACs
+  system-side and only reliably fetches them over http(s); a failed load falls back
+  to DIRECT with no error. Serving the same file over localhost http is what makes
+  Safari apply it.
 
 **One-time setup:**
 
 ```bash
-launchctl load -w ~/Library/LaunchAgents/local.vpn-pac.plist   # serves pac/ on 127.0.0.1:8899
+./install-pac-server.sh   # generates + loads the launchd agent (serves pac/ on :8899)
 ```
+
+`install-pac-server.sh` resolves the repo path and a working `python3` automatically,
+so **re-run it after moving the repo** or if the server ever stops. (It deliberately
+avoids Apple's `/usr/bin/python3` stub, which breaks when the Command Line Tools are
+missing/half-installed — a common cause of "split suddenly stopped working".)
 
 Then System Settings ▸ Network ▸ Wi-Fi ▸ Details ▸ Proxies ▸ enable *Automatic
 Proxy Configuration* ▸ URL `http://127.0.0.1:8899/discovery.pac`. The PAC returns
 `PROXY …; DIRECT`, so when the VPN is down those sites just load directly — set it
 once and forget it.
+
+If split silently stops (sites load but show your home country): the PAC server is
+almost certainly down. Check `curl -s http://127.0.0.1:8899/discovery.pac` and
+`/tmp/vpn-pac.log`, then re-run `./install-pac-server.sh`.
 
 **Change the domain list:** edit `client/domains.txt` (one domain per line,
 subdomains matched automatically) and re-run `./up.sh`.
