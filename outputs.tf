@@ -46,3 +46,10 @@ output "secret_arn" {
 output "preshared_key_secret_arn" {
   value = aws_secretsmanager_secret.preshared_key.arn
 }
+
+output "dashboard_url" {
+  description = "CloudWatch dashboard with per-profile usage."
+  value = var.enable_usage_metrics ? format(
+    "https://%s.console.aws.amazon.com/cloudwatch/home?region=%s#dashboards/dashboard/%s",
+  var.region, var.region, var.name) : "disabled (enable_usage_metrics = false)"
+}

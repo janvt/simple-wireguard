@@ -82,6 +82,8 @@ set -euo pipefail
 
 CONF=/etc/wireguard/wg0.conf
 PSK_FILE=/etc/wireguard/psk
+MAP=/var/lib/wireguard/peers.map
+mkdir -p /var/lib/wireguard
 
 peers=$(aws ssm get-parameter --region ${region} --name "${peers_param}" \
           --query Parameter.Value --output text 2>/dev/null || true)
@@ -93,6 +95,7 @@ fi
 psk=$(cat "$PSK_FILE")
 tmp=$(mktemp /etc/wireguard/.sync.XXXXXX)   # same fs as CONF, so the mv is atomic
 chmod 600 "$tmp"
+tmpmap=$(mktemp /var/lib/wireguard/.map.XXXXXX)
 
 # Keep the [Interface] section, discard every existing [Peer] block. NF drops blank
 # lines: without it the blank separating [Interface] from the first [Peer] is kept and
@@ -105,7 +108,12 @@ while read -r name pub suffix; do
   [ -n "$suffix" ] || continue
   printf '\n[Peer]\n# %s\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s.%s/32\n' \
     "$name" "$pub" "$psk" "${wg_net}" "$suffix" >> "$tmp"
+  printf '%s\t%s\n' "$pub" "$name" >> "$tmpmap"
 done <<< "$peers"
+
+# The usage collector resolves pubkeys to profile names through this. Written on every
+# run, before the early-exit below, so it stays correct even when the config doesn't change.
+mv "$tmpmap" "$MAP"
 
 # Nothing to do on the vast majority of timer ticks — skip the write and the reload.
 if cmp -s "$tmp" "$CONF"; then
@@ -155,6 +163,110 @@ systemctl enable --now wg-quick@wg0
 systemctl enable --now wg-sync-peers.timer
 # Pull the peers in now so the box is usable without waiting for the first timer tick.
 /usr/local/sbin/wg-sync-peers || echo "WARN: initial peer sync failed; the timer will retry" >&2
+
+cat > /usr/local/sbin/wg-usage-report <<'USAGE'
+#!/bin/bash
+# Publish per-profile WireGuard transfer to CloudWatch.
+#
+# Publishes per-interval DELTAS, not the raw counters: WireGuard's counters are
+# cumulative since the interface came up and reset to zero on every `wg-quick down`
+# (i.e. every ./down.sh). Deltas make Sum-over-a-window the honest answer, and a
+# counter that moved backwards is simply treated as a reset.
+#
+# BytesToPeer is the direction AWS bills — data leaving the instance for a client.
+set -euo pipefail
+
+NS="${namespace}"
+MAP=/var/lib/wireguard/peers.map
+STATE=/var/lib/wireguard/usage.state
+
+ip link show wg0 >/dev/null 2>&1 || exit 0
+[ -f "$MAP" ] || exit 0
+mkdir -p /var/lib/wireguard
+touch "$STATE"
+
+tmp=$(mktemp /var/lib/wireguard/.usage.XXXXXX)
+metrics=""
+n=0
+
+# `wg show dump` line 1 is the interface itself; peers follow, tab-separated:
+# pubkey, psk, endpoint, allowed-ips, latest-handshake, rx, tx, keepalive
+# `|| [ -n "$pub" ]` so a final line without a trailing newline still gets processed:
+# read returns non-zero at EOF even when it filled the variables, which would silently
+# drop the last peer.
+while IFS=$'\t' read -r pub _psk _ep _aip _hs rx tx _ka || [ -n "$pub" ]; do
+  [ -n "$pub" ] || continue
+  name=$(awk -F'\t' -v k="$pub" '$1==k{print $2; exit}' "$MAP")
+  [ -n "$name" ] || name=unknown
+  prx=$(awk -F'\t' -v k="$pub" '$1==k{print $2+0; exit}' "$STATE")
+  ptx=$(awk -F'\t' -v k="$pub" '$1==k{print $3+0; exit}' "$STATE")
+  [ -n "$prx" ] || prx=0
+  [ -n "$ptx" ] || ptx=0
+  drx=$(( rx >= prx ? rx - prx : rx ))
+  dtx=$(( tx >= ptx ? tx - ptx : tx ))
+  printf '%s\t%s\t%s\n' "$pub" "$rx" "$tx" >> "$tmp"
+  metrics="$metrics{\"MetricName\":\"BytesFromPeer\",\"Unit\":\"Bytes\",\"Value\":$drx,\"Dimensions\":[{\"Name\":\"Profile\",\"Value\":\"$name\"}]},"
+  metrics="$metrics{\"MetricName\":\"BytesToPeer\",\"Unit\":\"Bytes\",\"Value\":$dtx,\"Dimensions\":[{\"Name\":\"Profile\",\"Value\":\"$name\"}]},"
+  n=$((n+1))
+done < <(wg show wg0 dump | tail -n +2)
+
+mv "$tmp" "$STATE"
+
+# Zeros are published too, so an idle-but-connected profile reads 0 rather than a gap.
+if [ "$n" -gt 0 ]; then
+  aws cloudwatch put-metric-data --region ${region} --namespace "$NS" \
+    --metric-data "[$${metrics%,}]" >/dev/null 2>&1 || true
+fi
+USAGE
+chmod 700 /usr/local/sbin/wg-usage-report
+
+cat > /etc/systemd/system/wg-usage-report.service <<'UNIT'
+[Unit]
+Description=Publish per-profile WireGuard usage to CloudWatch
+After=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-usage-report
+UNIT
+
+cat > /etc/systemd/system/wg-usage-report.timer <<'UNIT'
+[Unit]
+Description=Sample WireGuard usage every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+# ./down.sh stops the box, which zeroes the counters — so take one last sample on the
+# way down. Ordered after network-online so it is stopped (and thus runs) while the
+# network is still up.
+cat > /etc/systemd/system/wg-usage-flush.service <<'UNIT'
+[Unit]
+Description=Flush final WireGuard usage sample at shutdown
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/wg-usage-report
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+if [ "${usage_metrics}" = "true" ]; then
+  systemctl enable --now wg-usage-report.timer
+  systemctl enable --now wg-usage-flush.service
+fi
 
 # Forward proxy for domain-based split tunneling. Reachable ONLY from the tunnel
 # subnet (the security group never exposes 3128), so browser traffic for the

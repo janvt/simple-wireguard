@@ -71,3 +71,27 @@ variable "peers" {
     error_message = "Two profiles share a public key. Each profile needs its own key pair."
   }
 }
+
+variable "enable_usage_metrics" {
+  description = "Publish per-profile WireGuard transfer to CloudWatch and build a dashboard."
+  type        = bool
+  default     = true
+}
+
+variable "metrics_namespace" {
+  description = "CloudWatch namespace for the per-profile usage metrics."
+  type        = string
+  default     = "WireGuardVPN"
+}
+
+variable "egress_price_per_gb" {
+  description = "Data-transfer-out price per GB in this region, for the dashboard's cost estimate."
+  type        = number
+  default     = 0.09 # eu-central-1, first 10 TB/mo
+}
+
+variable "free_egress_gb" {
+  description = "Monthly free data-transfer-out allowance in GB. Account-wide, not per instance."
+  type        = number
+  default     = 100
+}

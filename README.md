@@ -330,6 +330,74 @@ aws cloudwatch get-metric-statistics --namespace AWS/EC2 \
 
 Divide the result by 1e9 for GB; subtract 100, multiply the rest by $0.09.
 
+## Usage per profile (CloudWatch)
+
+WireGuard already counts bytes per peer; the instance samples those counters every
+minute, maps each public key back to its profile name, and publishes to CloudWatch
+under the `WireGuardVPN` namespace with a `Profile` dimension.
+
+```bash
+terraform output dashboard_url
+```
+
+Six widgets: egress and ingress per profile over time, a gauge showing how much of the
+free allowance you've burned, estimated cost broken down per profile, GB per profile,
+and the instance's raw `NetworkOut`.
+
+### How bytes become dollars
+
+The cost figure does **not** come from multiplying the tunnel counters by a price. It's
+derived from `NetworkOut` — the metric AWS actually meters — and the per-peer counters
+are used only to *split* that total:
+
+```
+GB          = NetworkOut / 1073741824
+total cost  = IF(GB > 100, (GB - 100) × $0.09, 0)
+per profile = total cost × (BytesToPeer_profile / Σ BytesToPeer)
+```
+
+That ordering matters. The tunnel counters undercount by the UDP and WireGuard
+encapsulation, so using them for the absolute number would understate the bill — but
+that overhead applies evenly to every peer, so it cancels out of the ratio. Absolute
+number from AWS, proportions from WireGuard.
+
+Price and allowance are `egress_price_per_gb` and `free_egress_gb` in
+[variables.tf](variables.tf), defaulting to eu-central-1's $0.09/GB and 100 GB.
+
+### Four caveats on the number
+
+- **The free 100 GB is account-wide.** The dashboard assumes this VPN is the only thing
+  in the account spending it. If anything else serves traffic, your real overage starts
+  sooner than the gauge suggests.
+- **Splitting the overage pro-rata is a judgement call.** The allowance is consumed in
+  aggregate, so there's no non-arbitrary way to say whose bytes were the free ones.
+  Pro-rata answers "who is responsible for what share of the bill", which is usually the
+  question worth asking — but the first 100 GB genuinely is free, and a profile under
+  that line costs nothing on its own.
+- **The window is a rolling 30 days, not a calendar month.** AWS's allowance resets on
+  the 1st; CloudWatch dashboards have no month-to-date range. Early in the month the
+  dashboard is looking partly at last month's traffic.
+- **`NetworkOut` is the whole instance**, including package updates and the SSM agent.
+  Small, but it isn't purely VPN traffic.
+
+Treat it as attribution, not invoicing. The authoritative number is Cost Explorer.
+
+### Deltas, not counters
+
+WireGuard's per-peer counters are cumulative since the interface came up, and reset to
+zero on every `./down.sh`. The collector publishes the *change* since its last sample
+and treats a counter that moved backwards as a reset, so `Sum` over any window is the
+real byte count for that window. A final sample is taken at shutdown, so the last minute
+before `./down.sh` isn't lost.
+
+### Cost of the monitoring itself
+
+A metric here is one profile × one direction, so two profiles is four custom metrics.
+Custom metrics run about $0.30/metric/month beyond CloudWatch's free allowance, and the
+first three dashboards are free — worth checking against your account, since it's the
+same order as the ~$1.90/mo idle bill and grows linearly with profiles. Set
+`enable_usage_metrics = false` to remove the collector and the dashboard entirely.
+
 ## Full teardown
 
 ```bash
