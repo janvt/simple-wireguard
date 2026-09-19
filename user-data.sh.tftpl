@@ -2,7 +2,20 @@
 # No `set -x` — the fetched private key must never land in the boot log.
 set -euo pipefail
 
-dnf install -y wireguard-tools iptables-nft squid
+# t4g.nano has 512 MB, and on a current AL2023 AMI `dnf` alone exceeds that while
+# parsing repo metadata — the install gets OOM-killed and the box comes up bare. The
+# EBS volume is already paid for, so a swapfile fixes it at no cost. Must run BEFORE
+# the first dnf. (Symptom without it: a tunnel that connects but passes no traffic.)
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# install_weak_deps=False keeps the transaction small, which matters on 512 MB.
+dnf install -y --setopt=install_weak_deps=False wireguard-tools iptables-nft squid
 
 # We manage this box via SSM, so SSH is unnecessary attack surface.
 systemctl disable --now sshd 2>/dev/null || true
@@ -42,6 +55,15 @@ SRV_PRIV=$(get_or_create "${priv_secret_id}" "wg genkey")  || { echo "FATAL: cou
 PSK=$(get_or_create "${psk_secret_id}" "wg genpsk")        || { echo "FATAL: could not obtain preshared key" >&2; exit 1; }
 
 umask 077
+
+# Every peer shares this PSK, so cache it locally: the sync script below runs on a
+# timer and shouldn't hit Secrets Manager each time. Root-only.
+printf '%s' "$PSK" > /etc/wireguard/psk
+chmod 600 /etc/wireguard/psk
+
+# [Interface] only — the [Peer] blocks are written by wg-sync-peers from the SSM
+# parameter Terraform publishes. That indirection is what lets you add or remove a
+# profile without rebuilding this instance.
 cat > /etc/wireguard/wg0.conf <<WG
 [Interface]
 Address = ${wg_net}.1/24
@@ -49,14 +71,90 @@ ListenPort = ${wg_port}
 PrivateKey = $SRV_PRIV
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $IFACE -j MASQUERADE
-
-[Peer]
-PublicKey = ${client_public_key}
-PresharedKey = $PSK
-AllowedIPs = ${wg_net}.2/32
 WG
 
+cat > /usr/local/sbin/wg-sync-peers <<'SYNC'
+#!/bin/bash
+# Rebuild wg0's peer list from SSM and apply it. Uses `wg syncconf`, which diffs
+# against the running interface rather than restarting it — so adding or removing
+# somebody's profile never drops the tunnels that are already connected.
+set -euo pipefail
+
+CONF=/etc/wireguard/wg0.conf
+PSK_FILE=/etc/wireguard/psk
+
+peers=$(aws ssm get-parameter --region ${region} --name "${peers_param}" \
+          --query Parameter.Value --output text 2>/dev/null || true)
+if [ -z "$peers" ] || [ "$peers" = "None" ]; then
+  echo "wg-sync-peers: peer list unavailable; keeping the current config" >&2
+  exit 0
+fi
+
+psk=$(cat "$PSK_FILE")
+tmp=$(mktemp /etc/wireguard/.sync.XXXXXX)   # same fs as CONF, so the mv is atomic
+chmod 600 "$tmp"
+
+# Keep the [Interface] section, discard every existing [Peer] block. NF drops blank
+# lines: without it the blank separating [Interface] from the first [Peer] is kept and
+# re-added on every run, so the file would grow a line each time the timer fires.
+awk '/^\[Peer\]/{exit} NF' "$CONF" > "$tmp"
+
+# One "name pubkey ip_suffix" line per profile.
+while read -r name pub suffix; do
+  [ -n "$pub" ] || continue
+  [ -n "$suffix" ] || continue
+  printf '\n[Peer]\n# %s\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s.%s/32\n' \
+    "$name" "$pub" "$psk" "${wg_net}" "$suffix" >> "$tmp"
+done <<< "$peers"
+
+# Nothing to do on the vast majority of timer ticks — skip the write and the reload.
+if cmp -s "$tmp" "$CONF"; then
+  rm -f "$tmp"
+  exit 0
+fi
+
+mv "$tmp" "$CONF"
+chmod 600 "$CONF"
+
+# Apply live when the interface is up; otherwise the file is read on next start.
+if ip link show wg0 >/dev/null 2>&1; then
+  wg syncconf wg0 <(wg-quick strip wg0)
+fi
+echo "wg-sync-peers: applied $(grep -c '^\[Peer\]' "$CONF") peer(s)"
+SYNC
+chmod 700 /usr/local/sbin/wg-sync-peers
+
+cat > /etc/systemd/system/wg-sync-peers.service <<'UNIT'
+[Unit]
+Description=Sync WireGuard peers from SSM
+After=wg-quick@wg0.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-sync-peers
+UNIT
+
+# OnBootSec covers the normal start-of-session boot; OnUnitActiveSec means a profile
+# added while the box is already running shows up within a couple of minutes.
+cat > /etc/systemd/system/wg-sync-peers.timer <<'UNIT'
+[Unit]
+Description=Periodically sync WireGuard peers from SSM
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
 systemctl enable --now wg-quick@wg0
+systemctl enable --now wg-sync-peers.timer
+# Pull the peers in now so the box is usable without waiting for the first timer tick.
+/usr/local/sbin/wg-sync-peers || echo "WARN: initial peer sync failed; the timer will retry" >&2
 
 # Forward proxy for domain-based split tunneling. Reachable ONLY from the tunnel
 # subnet (the security group never exposes 3128), so browser traffic for the
@@ -78,8 +176,18 @@ access_log none
 SQUID
 systemctl enable --now squid
 
-# Publish the public key LAST, as a readiness beacon: once this parameter is set,
-# WireGuard is up and listening.
 SRV_PUB=$(printf '%s' "$SRV_PRIV" | wg pubkey)
 unset SRV_PRIV PSK
 aws ssm put-parameter --region ${region} --name "${param_name}" --type String --overwrite --value "$SRV_PUB" >/dev/null 2>&1 || true
+
+# Readiness beacon, published LAST. It carries THIS instance's id, not just "done":
+# the public key parameter survives an instance replacement, so it can't distinguish a
+# freshly-built box from a dead one that inherited a valid key. up.sh compares this to
+# the instance it just started and refuses to hand out configs until they match.
+TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+IID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+        http://169.254.169.254/latest/meta-data/instance-id || true)
+if [ -n "$IID" ]; then
+  aws ssm put-parameter --region ${region} --name "${ready_param}" --type String --overwrite --value "$IID" >/dev/null 2>&1 || true
+fi

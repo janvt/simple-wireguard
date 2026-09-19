@@ -1,22 +1,28 @@
 # WireGuard split-tunnel VPN on AWS (Terraform)
 
 A personal WireGuard VPN on an EC2 instance in the AWS region of your choice
-(defaults to `eu-central-1`, i.e. a German exit IP) that gives your Mac an exit IP
+(defaults to `eu-central-1`, i.e. a German exit IP) that gives your devices an exit IP
 in that region. Built to be spun up for a session (e.g. a bike race on
 Discovery+) and stopped afterwards, with the compute bill only running while it's on.
+
+Supports **multiple profiles** — your Mac, your phone, a friend's laptop — each with
+its own key pair and its own address in the tunnel, so they can all be connected at
+the same time. See [Profiles](#profiles).
 
 ## How it's put together
 
 Clean split between **build** (Terraform, you run it) and **run** (scripts, no Terraform):
 
 - **Terraform** owns the *static* box: security group (shell), IAM role + instance
-  profile, the two Secrets Manager secrets, the SSM parameter, and the instance. You
+  profile, the two Secrets Manager secrets, the SSM parameters, and the instance. You
   run `./setup.sh` once, then `terraform apply` to build or rebuild.
+- **`./setup.sh`** owns the *profile list*: it generates a key pair per profile, assigns
+  each one a tunnel IP, and renders the public half into `terraform.tfvars`.
 - **`up.sh` / `down.sh`** own the *per-session* dynamics and **never run Terraform**.
-  `up.sh` starts the instance, points `vpn.example.com` at its new public IP, and opens
-  the firewall to your current source IP — all via the AWS CLI. `down.sh` stops it.
-- The **A record** and the **SG ingress rule** are deliberately *not* in Terraform
-  (they change every session), so a manual `terraform apply` never fights `up.sh`.
+  `up.sh` starts the instance and points `vpn.example.com` at its new public IP via the
+  AWS CLI. `down.sh` stops it.
+- The **A record** is deliberately *not* in Terraform (it changes every session), so a
+  manual `terraform apply` never fights `up.sh`.
 - **`dns/`** is a separate one-time config that creates the Route53 hosted zone for
   `vpn.example.com`. Isolated so a VPN teardown never disturbs the Cloudflare delegation.
 
@@ -33,21 +39,27 @@ dials a stable *name*. You never re-import, and there's no Elastic IP charge.
   rebuilds (get-or-create), so the server public key stays stable.
 - **Server public key**: published to an SSM parameter (not sensitive); `up.sh`
   reads it to render the client config.
-- **Client private key**: generated once locally into `client/client.key` (0600),
-  never leaves your Mac.
+- **Client private keys**: one per profile, generated locally into
+  `client/<profile>/private.key` (0600). A private key only ever leaves this Mac inside
+  the `.conf` you deliberately hand to someone. The server never sees it — WireGuard
+  authenticates peers by *public* key, which is all that reaches the instance.
+- **Peer list**: public keys only, published by Terraform to the `/<name>/peers` SSM
+  parameter. The instance syncs its `[Peer]` blocks from there at boot and every two
+  minutes, so **adding or removing a profile never rebuilds the box**.
 
 ## One-time setup
 
 Use **your own** hostname everywhere `vpn.example.com` appears below.
 
-**1. Record your hostname + generate the client key:**
+**1. Record your hostname + generate your first profile's key:**
 
 ```bash
 cd wg-vpn                       # wherever you cloned the repo
 ./setup.sh vpn.example.com     # your real hostname; prompts if you omit it
 ```
 
-Writes your client key and hostname into the git-ignored `terraform.tfvars` and
+Creates a profile called `mac`, generates its key pair, and writes your hostname plus
+the profile's *public* key into the git-ignored `terraform.tfvars` and
 `dns/terraform.tfvars`, so your real domain never ships in the repo (the committed
 defaults are the `vpn.example.com` placeholder).
 
@@ -84,12 +96,12 @@ terraform init && terraform apply
 ```
 
 Then install the **WireGuard** app (Mac App Store), import
-`client/wg-vpn-split.conf` once, and toggle it on.
+`client/mac/wg-mac-split.conf` once, and toggle it on.
 
 ## Daily use
 
 ```bash
-./up.sh     # start, point DNS at the new IP, open the firewall to your current IP
+./up.sh     # start, point DNS at the new IP, render any new configs
 ./down.sh   # stop it when you're done
 ```
 
@@ -98,10 +110,106 @@ re-import needed. If your box ever needs rebuilding, that's the only time you to
 Terraform again (`terraform apply`).
 
 **Credentials `up.sh`/`down.sh` need** (the IAM user/role you run them as): `ec2:StartInstances`,
-`ec2:StopInstances`, `ec2:DescribeInstances`, `ec2:DescribeSecurityGroups`,
-`ec2:AuthorizeSecurityGroupIngress`, `ec2:RevokeSecurityGroupIngress`,
+`ec2:StopInstances`, `ec2:DescribeInstances`,
 `route53:ListHostedZonesByName`, `route53:ChangeResourceRecordSets`,
 `ssm:GetParameter`, `secretsmanager:GetSecretValue`. (Admin covers all of these.)
+
+## Profiles
+
+Each profile is one WireGuard peer: its **own key pair** and its **own address** in the
+tunnel subnet. They're independent, so your Mac, your phone and a friend's laptop can
+all be connected at once.
+
+```bash
+./setup.sh list                  # what exists, and where each config lands
+./setup.sh add phone             # mode 'both'  -> split + full configs
+./setup.sh add friend full       # mode 'full'  -> one full-tunnel config
+./setup.sh rm  friend            # delete the profile and its key
+```
+
+`add` and `rm` only edit local state. To push the change to the server:
+
+```bash
+terraform apply    # publishes the new peer list to SSM
+./up.sh            # renders configs for any profile that doesn't have one yet
+```
+
+The instance re-reads the peer list at boot and every two minutes, so a profile added
+while the box is running goes live within a couple of minutes — **no rebuild, and no
+disruption to tunnels that are already connected** (the sync uses `wg syncconf`, which
+diffs rather than restarts).
+
+### Handing a config to someone
+
+The rendered `.conf` is everything they need — key, server address, PSK. They install
+WireGuard (App Store / Play Store), import it, toggle it on. For a phone, skip the file
+transfer entirely:
+
+```bash
+./setup.sh qr friend             # prints a QR code to scan from the app
+```
+
+Needs `brew install qrencode`.
+
+Two practical notes:
+
+- **Give a non-technical person a `full` profile.** Split mode needs the PAC server, the
+  launchd agent and a manual macOS proxy setting — none of which they'll want to do. Full
+  tunnel is just "toggle on". It costs more egress (see [Cost](#cost)), since *all* their
+  traffic crosses the instance.
+- **The `.conf` contains a private key.** Send it over something sane — AirDrop, Signal,
+  a password-manager share — not plaintext email.
+
+### Who holds which key
+
+`setup.sh` generates each profile's private key locally, so you hold your friend's key as
+well as your own. That's fine for a VPN you run for people you know: the only thing it
+lets you do is impersonate them *on your own server*, where you already terminate their
+traffic. It doesn't expand what you can see.
+
+What matters more is **attribution**: everything every profile does egresses from your
+instance, under your AWS account, so abuse reports land on you. Worth holding
+deliberately rather than discovering.
+
+If you'd rather not hold someone's key, they can generate their own (`wg genkey`) and
+send you only the public half. Add a row to `client/profiles.tsv` by hand — name, the
+next free suffix, a mode, their public key, tab-separated — then `terraform apply`. The
+server will serve that peer like any other; `up.sh` notes that it has no local key and
+renders nothing, so they assemble their own `.conf` from the server public key
+(`terraform output server_pubkey_param`), the PSK and their tunnel IP.
+
+### Upgrading from the single-client layout
+
+If you already ran this repo before profiles existed, `./setup.sh` migrates you:
+`client/client.key` is copied to `client/mac/private.key` and registered as profile
+`mac` at `10.8.0.2` — **same key, same tunnel IP**, so tunnels you've already imported
+into WireGuard keep working untouched. The old `client/wg-*.conf` files are left alone
+and can be deleted once the new ones are rendered.
+
+```bash
+./setup.sh          # migrate; rewrites terraform.tfvars in the new `peers` format
+terraform apply     # replaces the instance once (see below), publishes the peer list
+./up.sh
+```
+
+That first `terraform apply` **replaces the instance**, because the peer-sync machinery
+lives in user-data and user-data only runs on first boot. It's safe: the server private
+key and the PSK live in Secrets Manager and are re-fetched, so the replacement comes
+back with the same identity and every client config stays valid. Subsequent profile
+changes do *not* rebuild anything.
+
+It also adds the open UDP 51820 ingress rule. Any `/32` rule left behind by an older
+`up.sh` is harmless (it's a subset of the new one) but Terraform won't remove it, since
+it never managed it. To tidy up:
+
+```bash
+SG=$(terraform output -raw security_group_id)
+aws ec2 describe-security-groups --group-ids "$SG" \
+  --query "SecurityGroups[0].IpPermissions[?ToPort==\`51820\`].IpRanges[?CidrIp!='0.0.0.0/0'].CidrIp" \
+  --output text |
+  xargs -n1 -I{} aws ec2 revoke-security-group-ingress \
+    --group-id "$SG" --protocol udp --port 51820 --cidr {}
+```
 
 ## Split tunnel (default) — only stream domains go through the VPN
 
@@ -143,23 +251,41 @@ almost certainly down. Check `curl -s http://127.0.0.1:8899/discovery.pac` and
 **Change the domain list:** edit `client/domains.txt` (one domain per line,
 subdomains matched automatically) and re-run `./up.sh`.
 
-**Want everything routed instead?** `MODE=full ./up.sh` writes a *separate*
-`client/wg-vpn-full.conf` (full tunnel, no PAC). Import both once and flip
-between the `wg-vpn-split` and `wg-vpn-full` tunnels in the WireGuard
-menu bar — but run only one at a time (they share the same client key). Turn the
-macOS PAC off when using full mode. In split mode the IPv6-leak question is moot —
-general traffic isn't tunnelled at all.
+**Want everything routed instead?** Full tunnel is a per-profile setting, not a global
+flag. A profile created with mode `both` (the default) gets *two* configs rendered —
+`wg-<profile>-split.conf` and `wg-<profile>-full.conf` — so you import both once and
+flip between them in the WireGuard menu bar. Run only one at a time per profile: the
+two share that profile's key and tunnel IP. Turn the macOS PAC off when using full
+mode. In split mode the IPv6-leak question is moot — general traffic isn't tunnelled
+at all.
 
-## Firewall lock to your IP
+(The old `MODE=full ./up.sh` flag is gone; set the mode when you create the profile,
+or edit the `mode` column in `client/profiles.tsv` and delete the stale `.conf`.)
 
-Ingress is `UDP 51820` from **your current public IP only**. `up.sh` detects your
-IP each run and updates the SG rule directly via the AWS CLI (revoke the old, add
-the current) — so if your residential IP changed since last time, just running
-`up.sh` fixes it.
+## Firewall
 
-If your IP changes *mid-session* the tunnel drops and won't reconnect until you
-re-run `up.sh`. WireGuard is safe exposed either way (silent to unauthenticated
-packets); the lock is defense-in-depth.
+UDP 51820, open to the internet, managed by Terraform ([main.tf](main.tf)). Nothing
+about it varies per session, so `up.sh` doesn't touch it.
+
+**Exposing the port is the normal way to run WireGuard**, not a compromise:
+
+- It never answers an unauthenticated packet. To a scanner the port is
+  indistinguishable from closed or filtered — you don't show up as a WireGuard endpoint.
+- The handshake carries a MAC keyed on the *server's* public key, checked before any
+  Curve25519 work happens. Someone who doesn't already know that key can't make the box
+  spend a single expensive crypto cycle, so handshake-flood attacks don't apply. A
+  second cookie layer covers genuine load.
+- Fixed cryptography, no negotiation, no certificate parsing — roughly 4k lines of
+  kernel code against OpenVPN's hundreds of thousands. Most VPN CVEs historically live
+  in exactly the parsing and negotiation complexity WireGuard doesn't have.
+- The **pre-shared key** is mixed into every handshake on top of that.
+
+Earlier versions locked ingress to your current public IP. That couldn't survive
+multiple profiles: a security group filters on protocol and port, not on WireGuard
+identity, so the rule is all-or-nothing across every peer and can't cover a friend
+dialling in from their own changing address. What the lock bought was defense-in-depth
+against a hypothetical zero-day in the handshake path, reachable only by someone who
+already knew the server's public key. Nothing cryptographic depended on it.
 
 ## Cost
 
@@ -188,6 +314,11 @@ counts.
 and counts — general browsing, downloads, and OS updates never touch the instance.
 Full-tunnel mode routes *everything* through AWS and would inflate this.
 
+**With several profiles the allowance is shared.** The 100 GB/month is account-wide, not
+per profile, and a full-tunnel guest pushes all their browsing through the instance —
+so a handed-out `full` config eats the budget considerably faster than your own split
+usage does.
+
 Check actual outbound bytes over the last 30 days:
 
 ```bash
@@ -212,9 +343,17 @@ to redo the Cloudflare delegation. To remove it too: `cd dns && terraform destro
 ## Hardening baked in
 
 IMDSv2-only with hop limit 1, source/dest check off, `sshd` disabled (SSM only),
-automatic security updates, a **WireGuard pre-shared key** (extra symmetric layer on
-both peers, generated on-box → Secrets Manager), and the scoped IAM policy (the
-instance can touch only its own secrets + parameter).
+automatic security updates, a **WireGuard pre-shared key** (extra symmetric layer,
+generated on-box → Secrets Manager, shared by every peer — it's a second factor on the
+handshake, not a per-peer identity, so sharing it costs nothing), and the scoped IAM
+policy (the instance can read/write only its own secrets and parameters; the peer list
+it can only read).
+
+Note that peers are **not** isolated from each other: `10.8.0.0/24` is a shared subnet
+and the box forwards freely, so profiles can reach one another. Cryptokey routing still
+stops anyone spoofing as somebody else, since the server pins each peer to its own
+`/32`. If you ever hand a profile to someone you don't fully trust, add a
+`FORWARD -i wg0 -o wg0 -j DROP` rule to the `PostUp` line in `user-data.sh.tftpl`.
 
 ### A note on IPv6 (no leak)
 
